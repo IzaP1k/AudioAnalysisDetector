@@ -1,12 +1,16 @@
 
 import os
+import pickle
+import random
 import time
 import numpy as np
 import pandas as pd
 import pywt
+from matplotlib import pyplot as plt
 from scipy.fftpack import dct
 from scipy.interpolate import interp1d
 import soundfile as sf
+import joblib
 
 import parselmouth
 import librosa
@@ -17,7 +21,7 @@ from joblib import Parallel, delayed
 from sklearn.metrics import (
     classification_report,
     accuracy_score,
-    f1_score
+    f1_score, roc_curve
 )
 from sklearn.pipeline import Pipeline
 from sklearn.decomposition import PCA, FastICA
@@ -52,6 +56,7 @@ except Exception:
 
 from omegaconf import OmegaConf
 
+
 config = OmegaConf.load("config.yaml")
 
 METADATA_PATH_DF = config.datasets.DF.metadata
@@ -69,7 +74,59 @@ FLAC_FOLDER_LA_1 = config.datasets.LA.flac[0]
 COLS_LA = config.datasets.LA.columns
 
 
+def augment_audio(data, sr, mode="change pitch", factor=None):
 
+    if mode == "change pitch":
+        if factor is None:
+            factor=0.005
+        augmented = librosa.effects.pitch_shift(data, sr=sr, n_steps=factor)
+    elif mode == "noise":
+        if factor is None:
+            factor=1.022
+        noise = np.random.randn(len(data))
+        augmented = data + factor * noise
+        augmented = augmented.astype(data.dtype)
+    else:
+        augmented = data
+
+    return augmented, sr
+
+
+def add_dataAugmentation(df, col_name="augmentationType", aug_type=None):
+    if aug_type is None:
+        aug_type = ['change pitch', 'noise']
+
+    # Dodaj kolumnę jeśli nie istnieje i ustaw wszystkie wartości na None
+    if col_name not in df.columns:
+        df[col_name] = None
+    else:
+        df[col_name] = None
+
+    extra_rows = []
+
+    for _, row in df.iterrows():
+        # 80% szansy na dodanie jednego typu augmentacji
+        if random.random() < 0.8:
+            chosen_aug = random.choice(aug_type)
+            row_copy = row.copy()
+            row_copy[col_name] = chosen_aug
+            extra_rows.append(row_copy)
+
+        # 50% szansy na dodanie dwóch różnych typów augmentacji
+        if random.random() < 0.5 and len(aug_type) > 1:
+            aug_pair = random.sample(aug_type, 2)
+            for aug in aug_pair:
+                row_copy = row.copy()
+                row_copy[col_name] = aug
+                extra_rows.append(row_copy)
+
+    if extra_rows:
+        df_aug = pd.concat([df, pd.DataFrame(extra_rows)], ignore_index=True)
+    else:
+        print("Brak zmian")
+        df_aug = df.copy()
+
+    return df_aug
 def downsampled_dataset(df, label1=1, label2=0):
     class_1 = df[df.target == label1]
     class_2 = df[df.target == label2]
@@ -346,13 +403,17 @@ def analyze_formants_and_silence(filepath, silence_threshold_db=20, chunk_start=
         return None
 
 
-def extract_mfcc(filepath, chunk_start=None, chunk_end=None, sr=None, n_mfcc=13, mean=False):
+def extract_mfcc(filepath, chunk_start=None, chunk_end=None, sr=None, n_mfcc=13, mean=False, augment=None):
     try:
         y, sr = librosa.load(filepath, sr=sr)
+
         if chunk_start is not None and chunk_end is not None:
             start_sample = int(chunk_start * sr)
             end_sample = min(int(chunk_end * sr), len(y))
             y = y[start_sample:end_sample]
+
+        if augment is not None:
+            y, sr = augment_audio(y, sr, mode=augment)
 
         mfcc_feat = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
         return np.mean(mfcc_feat, axis=1) if mean else mfcc_feat
@@ -361,13 +422,16 @@ def extract_mfcc(filepath, chunk_start=None, chunk_end=None, sr=None, n_mfcc=13,
         return None
 
 
-def extract_lfcc(filepath, chunk_start=None, chunk_end=None, n_ceps=13, mean=False):
+def extract_lfcc(filepath, chunk_start=None, chunk_end=None, n_ceps=13, mean=False, augment=None):
     try:
         y, sr = librosa.load(filepath, sr=None)
         if chunk_start is not None and chunk_end is not None:
             start_sample = int(chunk_start * sr)
             end_sample = min(int(chunk_end * sr), len(y))
             y = y[start_sample:end_sample]
+
+        if augment is not None:
+            y, sr = augment_audio(y, sr, mode=augment)
 
         y_int16 = (y * 32767).astype(np.int16)
         lfccs = lfcc(sig=y_int16, fs=sr, num_ceps=n_ceps)
@@ -378,13 +442,16 @@ def extract_lfcc(filepath, chunk_start=None, chunk_end=None, n_ceps=13, mean=Fal
 
 
 def extract_cqcc(filepath, chunk_start=None, chunk_end=None, sr=None,
-                 bins_per_octave=12, n_ceps=19, mean=False):
+                 bins_per_octave=12, n_ceps=19, mean=False, augment=None):
     try:
         y, sr = librosa.load(filepath, sr=sr)
         if chunk_start is not None and chunk_end is not None:
             start_sample = int(chunk_start * sr)
             end_sample = min(int(chunk_end * sr), len(y))
             y = y[start_sample:end_sample]
+
+        if augment is not None:
+            y, sr = augment_audio(y, sr, mode=augment)
 
         fmin = librosa.note_to_hz('C1')
         fmax = sr / 2 - 100
@@ -402,10 +469,7 @@ def extract_cqcc(filepath, chunk_start=None, chunk_end=None, sr=None,
             interp_func = interp1d(original_freqs, cqt_db[:, t], kind='linear', fill_value="extrapolate")
             interp_cqt[:, t] = interp_func(lin_freqs)
 
-        interp_cqt = np.maximum(interp_cqt, 1e-8)
-        interp_lin = np.power(10.0, interp_cqt / 20.0)
-        log_power = np.log1p(interp_lin)
-
+        log_power = np.log(np.square(interp_cqt) + 1e-12)
         cqcc_coeffs = dct(log_power, type=2, axis=0, norm='ortho')[:n_ceps, :]
 
         if mean:
@@ -419,13 +483,16 @@ def extract_cqcc(filepath, chunk_start=None, chunk_end=None, sr=None,
         return None
 
 
-def extract_gtcc(filepath, chunk_start=None, chunk_end=None, sr=None, n_filters=40, n_ceps=13, mean=False):
+def extract_gtcc(filepath, chunk_start=None, chunk_end=None, sr=None, n_filters=40, n_ceps=13, mean=False, augment=None):
     try:
         y, sr = librosa.load(filepath, sr=sr)
         if chunk_start is not None and chunk_end is not None:
             start_sample = int(chunk_start * sr)
             end_sample = min(int(chunk_end * sr), len(y))
             y = y[start_sample:end_sample]
+
+        if augment is not None:
+            y, sr = augment_audio(y, sr, mode=augment)
 
         gtccs = gfcc(sig=y, fs=sr, num_ceps=n_ceps, nfilts=n_filters)
         return np.mean(gtccs, axis=1) if mean else gtccs
@@ -434,13 +501,17 @@ def extract_gtcc(filepath, chunk_start=None, chunk_end=None, sr=None, n_filters=
         return None
 
 
-def extract_wpt(filepath, chunk_start=None, chunk_end=None, mean=False):
+def extract_wpt(filepath, chunk_start=None, chunk_end=None, mean=False, augment=None):
     try:
         y, sr = librosa.load(filepath, sr=None)
         if chunk_start is not None and chunk_end is not None:
             start_sample = int(chunk_start * sr)
             end_sample = min(int(chunk_end * sr), len(y))
             y = y[start_sample:end_sample]
+
+        if augment is not None:
+            y, sr = augment_audio(y, sr, mode=augment)
+
 
         wp = pywt.WaveletPacket(data=y, wavelet='db4', mode='symmetric', maxlevel=3)
         wpt_feat = np.array([np.mean(np.square(node.data)) for node in wp.get_level(3, 'natural')])
@@ -450,13 +521,16 @@ def extract_wpt(filepath, chunk_start=None, chunk_end=None, mean=False):
         return None
 
 
-def extract_mel_spectrogram(filepath, chunk_start=None, chunk_end=None, sr=None, n_mels=64, fmax=None, mean=False):
+def extract_mel_spectrogram(filepath, chunk_start=None, chunk_end=None, sr=None, n_mels=64, fmax=None, mean=False, augment=None):
     try:
         y, sr = librosa.load(filepath, sr=sr)
         if chunk_start is not None and chunk_end is not None:
             start_sample = int(chunk_start * sr)
             end_sample = min(int(chunk_end * sr), len(y))
             y = y[start_sample:end_sample]
+
+        if augment is not None:
+            y, sr = augment_audio(y, sr, mode=augment)
 
         S = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, fmax=fmax or sr / 2)
         S_db = librosa.power_to_db(S, ref=np.max)
@@ -504,6 +578,68 @@ class ResidualBlock(nn.Module):
         out += identity
         out = self.bn2(out)
         out = self.relu2(out)
+        return out
+
+
+class ExtractFeatureResidual(nn.Module):
+    def __init__(self):
+        super(ExtractFeatureResidual, self).__init__()
+        self.initial_sequence = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(negative_slope=0.01)
+        )
+        self.residual_blocks = nn.Sequential(
+            ResidualBlock(32, 32, stride=3),
+            ResidualBlock(32, 32, stride=1),
+            ResidualBlock(32, 32, stride=1),
+            ResidualBlock(32, 32, stride=1),
+            ResidualBlock(32, 32, stride=1),
+            ResidualBlock(32, 32, stride=1)
+        )
+
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.feature_extractions = nn.Sequential(
+            nn.Linear(32, 256),
+            nn.Dropout(p=0.5),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(256, 64)
+        )
+
+    def forward(self, x):
+        out = self.initial_sequence(x)
+        out = self.residual_blocks(out)
+        out = self.avg_pool(out)
+        out = torch.flatten(out, 1)
+
+        out = self.feature_extractions(out)
+
+        return out
+
+class MoreFeaturesClassifier(nn.Module):
+    def __init__(self, num_classes=2):
+        super(MoreFeaturesClassifier, self).__init__()
+        self.initial_feature_extract = ExtractFeatureResidual()
+
+        self.classifier = nn.Sequential(
+            nn.Linear(96, 128),
+            nn.Dropout(p=0.5),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(128, 256),
+            nn.Dropout(p=0.5),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x1, x2, x3):
+        out1 = self.initial_feature_extract(x1)
+        out2 = self.initial_feature_extract(x2)
+        out3 = self.initial_feature_extract(x3)
+
+        combined = torch.cat((out1, out2, out3), dim=1)  # dim=1, bo łączymy po cechach (nie po batchu)
+
+        out = self.classifier(combined)
         return out
 
 
@@ -562,6 +698,130 @@ class FeatureColumnDataset(Dataset):
             x = x[np.newaxis, :, :]
         return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
+import torch
+import matplotlib.pyplot as plt
+
+def train_loop(model, optimizer, criterion, train_loader, test_loader, device,
+               train_losses, val_losses, feature_col, epochs=100):
+
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+
+            if outputs.ndim == 2 and outputs.shape[1] == 1:
+                loss = criterion(outputs, y_batch.float())
+                predicted = (torch.sigmoid(outputs) >= 0.5).float()
+
+            else:
+                loss = criterion(outputs, y_batch.long())
+                _, predicted = torch.max(outputs, 1)
+
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item() * X_batch.size(0)
+            total += y_batch.size(0)
+            correct += (predicted == y_batch).sum().item()
+
+        train_loss = running_loss / total
+        train_acc = correct / total
+
+        # Ewaluacja
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            for X_batch, y_batch in test_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                outputs = model(X_batch)
+
+                if outputs.ndim == 2 and outputs.shape[1] == 1:
+                    loss = criterion(outputs, y_batch.float())
+                    predicted = (torch.sigmoid(outputs) >= 0.5).float()
+                else:
+                    loss = criterion(outputs, y_batch.long())
+                    _, predicted = torch.max(outputs, 1)
+
+                val_loss += loss.item() * X_batch.size(0)
+                val_total += y_batch.size(0)
+                val_correct += (predicted == y_batch).sum().item()
+
+        val_loss /= val_total
+        val_acc = val_correct / val_total
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+
+        print(f"[{feature_col}] Epoch {epoch + 1}/{epochs} | "
+              f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+
+    plt.figure(figsize=(8, 5))
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.title(f'Loss Curve for {feature_col}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def model_result_metrics(model, test_loader, device, y_true, y_pred, y_scores):
+    model.eval()
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+
+            # --- automatyczne rozpoznanie typu modelu ---
+            if outputs.ndim == 2 and outputs.shape[1] == 1:
+                # Binary classification → sigmoid
+                probs = torch.sigmoid(outputs).squeeze(1)
+                predicted = (probs >= 0.5).float()
+                y_true.extend(y_batch.cpu().numpy())
+                y_pred.extend(predicted.cpu().numpy())
+                y_scores.extend(probs.cpu().numpy())
+
+            elif outputs.ndim == 2 and outputs.shape[1] > 1:
+                # Multiclass classification → softmax
+                probs = torch.softmax(outputs, dim=1)
+                _, predicted = torch.max(probs, 1)
+
+                # Jeśli binary softmax (np. 2 klasy), weź tylko kolumnę klasy 1
+                if probs.shape[1] == 2:
+                    probs = probs[:, 1]
+
+                y_true.extend(y_batch.cpu().numpy())
+                y_pred.extend(predicted.cpu().numpy())
+                y_scores.extend(probs.cpu().numpy())
+
+            else:
+                raise ValueError(f"Nieoczekiwany kształt wyjścia modelu: {outputs.shape}")
+
+    # --- metryki ---
+    f1 = f1_score(y_true, y_pred, average='binary' if len(np.unique(y_true)) == 2 else 'macro')
+    acc = accuracy_score(y_true, y_pred)
+
+    # EER tylko dla klasyfikacji binarnej
+    if len(np.unique(y_true)) == 2:
+        fpr, tpr, _ = roc_curve(y_true, y_scores, pos_label=1)
+        fnr = 1 - tpr
+        eer = fpr[np.nanargmin(np.abs(fnr - fpr))]
+        print(f"Final Accuracy: {acc:.4f} | F1 Score: {f1:.4f} | EER: {eer:.4f}")
+    else:
+        print(f"Final Accuracy: {acc:.4f} | F1 Score (macro): {f1:.4f}")
+
 
 def train_feature_model(final_df, feature_col, label_col='label', batch_size=32, epochs=10, device=None, test_df=None):
     if device is None:
@@ -582,75 +842,62 @@ def train_feature_model(final_df, feature_col, label_col='label', batch_size=32,
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
 
-    for epoch in range(epochs):
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
+    train_losses = []
+    val_losses = []
 
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+    train_loop(model, optimizer, criterion, train_loader, test_loader, device, train_losses, val_losses, feature_col,
+               epochs)
 
-            optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item() * X_batch.size(0)
-            _, predicted = torch.max(outputs, 1)
-            total += y_batch.size(0)
-            correct += (predicted == y_batch).sum().item()
-
-        train_loss = running_loss / total
-        train_acc = correct / total
-
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        with torch.no_grad():
-            for X_batch, y_batch in test_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                outputs = model(X_batch)
-                loss = criterion(outputs, y_batch)
-
-                val_loss += loss.item() * X_batch.size(0)
-                _, predicted = torch.max(outputs, 1)
-                val_total += y_batch.size(0)
-                val_correct += (predicted == y_batch).sum().item()
-
-        val_loss /= val_total
-        val_acc = val_correct / val_total
-
-        print(
-            f"[{feature_col}] Epoch {epoch + 1}/{epochs} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-
+    y_true = []
+    y_pred = []
+    y_scores = []
+    model_result_metrics(model, test_loader, device, y_true, y_pred, y_scores)
     return model, test_loader
 
 
-def train_all_features(final_df, feature_cols, test_df=None, label_col='label', batch_size=32, epochs=10):
+
+def train_all_features(final_df, feature_cols, test_df=None, label_col='label', batch_size=32, epochs=10, model_dir="Res_Net", standard_scaler=True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     trained_models = {}
+
+    os.makedirs(model_dir, exist_ok=True)
 
     for feat in feature_cols:
         print(f"\n=== TRENING dla cechy: {feat} ===")
 
-        df_clean = final_df.dropna(subset=[feat, label_col]).reset_index(drop=True)
-
-        if df_clean.empty:
+        if final_df.empty:
             print(f"[UWAGA] Brak danych do treningu dla cechy {feat} po usunięciu NaN!")
             continue
 
-        model, test_loader = train_feature_model(df_clean, feat, label_col, batch_size, epochs, device, test_df=test_df)
+        feat_dir = os.path.join(model_dir, feat)
+
+        if standard_scaler:
+            scaler = StandardScaler()
+            all_train_features_for_scaler = np.vstack(final_df[feat].values)
+            scaler.fit(all_train_features_for_scaler)
+
+            final_df[feat] = final_df[feat].apply(lambda x: scaler.transform(x))
+            if test_df is not None and not test_df.empty:
+                test_df[feat] = test_df[feat].apply(lambda x: scaler.transform(x))
+
+
+            os.makedirs(feat_dir, exist_ok=True)
+            scaler_path = os.path.join(feat_dir, f"{feat}_scaler.pkl")
+            joblib.dump(scaler, scaler_path)
+
+        model, test_loader = train_feature_model(final_df, feat, label_col, batch_size, epochs, device, test_df=test_df)
         trained_models[feat] = [model, test_loader]
+
+        model_path = os.path.join(feat_dir, f"{feat}_model.pt")
+        torch.save(model.state_dict(), model_path)
+        print(f"Model dla cechy '{feat}' zapisany w '{model_path}'")
+
         print(f"=== KONIEC treningu dla cechy: {feat} ===\n")
 
     return trained_models
 
+def extract_features(final_df, feature_extractors_map, col_name='filepath', mean=False, aug_col="augmentationType"):
 
-def extract_features(final_df, feature_extractors_map, col_name='filepath', mean=False):
-    print("mean ", mean)
     for name, func in feature_extractors_map.items():
         print(f"   - Ekstrahuję: {name}")
 
@@ -659,7 +906,8 @@ def extract_features(final_df, feature_extractors_map, col_name='filepath', mean
                 row[col_name],
                 chunk_start=row.get('chunk_start', None),
                 chunk_end=row.get('chunk_end', None),
-                mean=mean
+                mean=mean,
+                augment=row.get(aug_col, None)
             )
             for _, row in final_df.iterrows()
         )
@@ -707,8 +955,30 @@ def balance_func(final_df, col_name='label_num'):
 
     return final_df_balanced
 
+def prepare_train_test_data_multi(df, feature_cols, label_name="label", model_dir="Res_Net", test_df=None):
+    if test_df is None:
+        train_df, test_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df[label_name])
+    else:
+        train_df = df.copy()
+        test_df = test_df.copy()
 
-def prepare_train_test_data(df, test_df=None, col_name="cqcc", label_name="label_num"):
+    scalers = {}
+
+    for col_name in feature_cols:
+        scaler = StandardScaler()
+        all_train_features_for_scaler = np.vstack(train_df[col_name].values)
+        scaler.fit(all_train_features_for_scaler)
+
+        train_df[col_name] = train_df[col_name].apply(lambda x: scaler.transform(x))
+        test_df[col_name] = test_df[col_name].apply(lambda x: scaler.transform(x))
+
+        joblib.dump(scaler, os.path.join(model_dir, f"{col_name}_scaler.pkl"))
+        scalers[col_name] = scaler
+
+    return train_df, test_df, scalers
+
+
+def prepare_train_test_data(df, test_df=None, col_name="cqcc", label_name="label_num", model_dir="GMM-BiLSTM"):
     if test_df is None:
         train_df, test_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df[label_name])
     else:
@@ -722,10 +992,13 @@ def prepare_train_test_data(df, test_df=None, col_name="cqcc", label_name="label
     train_df[col_name] = train_df[col_name].apply(lambda x: scaler.transform(x))
     test_df[col_name] = test_df[col_name].apply(lambda x: scaler.transform(x))
 
+    joblib.dump(scaler, os.path.join(model_dir, "scaler.pkl"))
+
     return train_df, test_df, scaler
 
 
-def gmm_model(train_df, N_COMPONENTS_GMM=128, feature_name='cqcc', label_name="label_num"):
+def gmm_model(train_df, N_COMPONENTS_GMM=128, feature_name='cqcc', label_name="label_num", model_dir="GMM-BiLSTM"):
+    os.makedirs(model_dir, exist_ok=True)
     print("Trening Gaussian Mixture (UBM)...")
 
     all_train_features_gmm = np.vstack(train_df['cqcc'].values)
@@ -743,8 +1016,26 @@ def gmm_model(train_df, N_COMPONENTS_GMM=128, feature_name='cqcc', label_name="l
     end_time_map = time.time()
     print(f"Adaptacja MAP zakończona w {end_time_map - start_time_map:.2f} sekund.")
 
+    with open(os.path.join(model_dir, "ubm.pkl"), "wb") as f:
+        pickle.dump(ubm, f)
+    with open(os.path.join(model_dir, "gmm_genuine.pkl"), "wb") as f:
+        pickle.dump(gmm_genuine, f)
+    with open(os.path.join(model_dir, "gmm_df.pkl"), "wb") as f:
+        pickle.dump(gmm_df, f)
+    print(f"Modele GMM zapisane w folderze '{model_dir}/'.")
+
     return gmm_genuine, gmm_df
 
+def load_gmm_models(model_dir, ubm_model= "ubm.pkl", gmm_genuine_model="gmm_genuine.pkl", gmm_df_name="gmm_df.pkl"):
+    print("Wczytywanie zapisanych modeli GMM...")
+    with open(os.path.join(model_dir, ubm_model), "rb") as f:
+        ubm = pickle.load(f)
+    with open(os.path.join(model_dir, gmm_genuine_model), "rb") as f:
+        gmm_genuine = pickle.load(f)
+    with open(os.path.join(model_dir, gmm_df_name), "rb") as f:
+        gmm_df = pickle.load(f)
+    print("Modele GMM pomyślnie wczytane.")
+    return ubm, gmm_genuine, gmm_df
 
 def map_adapt(gmm_ubm, features, relevance_factor=10, max_iterations=20):
     gmm_class = GaussianMixture(n_components=gmm_ubm.n_components, covariance_type='diag', random_state=42)
@@ -804,8 +1095,11 @@ def collate_fn_padd(batch):
     return padded_features, labels
 
 
-def BiLSTM_model(train_df, test_df, col_name="cqcc", num_epochs=100, model=None, criterion=None, optimizer=None):
+def BiLSTM_model(train_df, test_df, col_name="cqcc", num_epochs=100, model=None, criterion=None, optimizer=None, model_dir="GMM-BiLSTM"):
     print("Tworzenie DataLoaderów...")
+    os.makedirs(model_dir, exist_ok=True)
+    print("Utworzono folder: ", model_dir)
+
     train_dataset = AudioDataset(train_df)
     test_dataset = AudioDataset(test_df)
 
@@ -838,6 +1132,9 @@ def BiLSTM_model(train_df, test_df, col_name="cqcc", num_epochs=100, model=None,
 
     print("Początek pętli treningowej BiLSTM...")
     start_time_bilstm = time.time()
+
+    train_losses = []
+    val_losses = []
 
     for epoch in range(num_epochs):
         model.train()
@@ -882,6 +1179,9 @@ def BiLSTM_model(train_df, test_df, col_name="cqcc", num_epochs=100, model=None,
         avg_val_loss = val_loss / len(test_loader)
         val_accuracy = correct / total if total > 0 else 0
 
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
+
         print(f"Epoch {epoch + 1}/{num_epochs} | "
               f"Train Loss: {avg_train_loss:.4f} | "
               f"Val Loss: {avg_val_loss:.4f} | "
@@ -890,7 +1190,22 @@ def BiLSTM_model(train_df, test_df, col_name="cqcc", num_epochs=100, model=None,
     end_time_bilstm = time.time()
     print(f"Trening BiLSTM zakończony w {end_time_bilstm - start_time_bilstm:.2f} sekund.")
 
+    plt.figure(figsize=(8, 5))
+    plt.plot(train_losses, label="Train Loss")
+    plt.plot(val_losses, label="Val Loss")
+    plt.title("BiLSTM Loss over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    model_path = os.path.join(model_dir, "bilstm_model.pt")
+    torch.save(model.state_dict(), model_path)
+    print(f"Model BiLSTM zapisany w '{model_path}'")
+
     return model, test_loader
+
 
 
 class BiLSTMClassifier(nn.Module):
@@ -931,51 +1246,58 @@ def fused_score(model, x_tensor, features_np, gmm_genuine, gmm_df):
         return 0.5 * bi_lstm_prob + 0.5 * gmm_prob
 
 
+
+
 def eval_model(model, train_df, test_df, test_loader, feature_name: str = 'cqcc',
-               label_name: str = "label", use_melspect = False):
-    print("Rozpoczynanie ewaluacji...")
+               label_name: str = "label", model_dir = "GMM-BiLSTM", use_saved_models=True, verbose=True,
+               list_model_gmm=None):
 
-    gmm_genuine, gmm_df = gmm_model(train_df, feature_name=feature_name, label_name=label_name)
+    if list_model_gmm is None:
+        list_model_gmm = ["gmm_genuine.pkl", "gmm_df.pkl"]
+    if use_saved_models and all(os.path.exists(os.path.join(model_dir, f)) for f in list_model_gmm):
+        _, gmm_genuine, gmm_df = load_gmm_models(model_dir)
+    else:
+        if train_df is None:
+            raise ValueError("train_df potrzebne do trenowania GMM, jeśli use_saved_models=False")
+        gmm_genuine, gmm_df = gmm_model(train_df, feature_name=feature_name, label_name=label_name)
 
-    y_true = []
-    y_pred = []
-
+    y_true, y_pred, scores = [], [], []
     start_time_eval = time.time()
-    if len(test_loader) == 0 and len(test_df) > 0:
-        print("Ostrzeżenie: test_loader jest pusty, ale test_df ma dane. Może być problem z batch_size lub collate_fn.")
 
     for batch_idx, (X_batch, y_batch) in enumerate(test_loader):
-        if X_batch.size(0) == 0:
-            print(f"Ostrzeżenie: Pusta partia testowa w batch {batch_idx}. Pomijam.")
-            continue
-
         for i in range(X_batch.size(0)):
             sample_x_tensor = X_batch[i]
-
-            original_features_mask = (sample_x_tensor.sum(dim=1) != 0)
-            print("original_features_mask: ", original_features_mask)
-            print("sample_x_tensor: ", sample_x_tensor)
-            sample_features_np = sample_x_tensor[original_features_mask].cpu().numpy()
-
-            if sample_features_np.shape[0] == 0:
-                score = 0.5
-                print(f"Ostrzeżenie: Próbka {i} w partii {batch_idx} jest cała z paddingu. Przypisuję score 0.5.")
-            else:
-                score = fused_score(model, sample_x_tensor, sample_features_np, gmm_genuine, gmm_df)
-
+            mask = (sample_x_tensor.sum(dim=1) != 0)
+            sample_features_np = sample_x_tensor[mask].cpu().numpy()
+            score = fused_score(model, sample_x_tensor, sample_features_np, gmm_genuine, gmm_df) \
+                if sample_features_np.size else 0.5
+            scores.append(score)
             y_pred.append(1 if score > 0.5 else 0)
-
         y_true.extend(y_batch.numpy())
 
     end_time_eval = time.time()
-    print(f"Ewaluacja zakończona w {end_time_eval - start_time_eval:.2f} sekund.")
+    if verbose:
+        print(f"Ewaluacja zakończona w {end_time_eval - start_time_eval:.2f} sekund.")
 
-    print("\n--- Wyniki końcowe ---")
-    if len(y_true) == 0:
-        print("Brak danych do ewaluacji (y_true jest puste).")
-    else:
-        print("Accuracy:", accuracy_score(y_true, y_pred))
-        print("F1:", f1_score(y_true, y_pred))
+    from sklearn.metrics import accuracy_score, f1_score, roc_curve
+    import numpy as np
+
+    accuracy = accuracy_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    fpr, tpr, thresholds = roc_curve(y_true, scores, pos_label=1)
+    fnr = 1 - tpr
+    eer_threshold = thresholds[np.nanargmin(np.absolute(fnr - fpr))]
+    eer = fpr[np.nanargmin(np.absolute(fnr - fpr))]
+
+    if verbose:
+        print("\n--- Wyniki końcowe ---")
+        print("Accuracy:", accuracy)
+        print("F1:", f1)
+        print("EER:", eer)
+
+    metrics = {"accuracy": accuracy, "f1": f1, "eer": eer}
+    return y_true, y_pred, metrics
+
 
 
 def _to_array_safe(x):
@@ -1218,3 +1540,18 @@ def run_extensive_gridsearch(
     print(top_models[['model', 'feature_set', 'test_score', 'precision', 'recall', 'f1', 'best_params']])
 
     return top_models, df_res
+
+
+def prepare_data_GMM_BiLSTM(df, label_col="label", feature_col="cqcc", transpose_func=transpose_cqcc):
+    df = filtr_nan(df.copy())
+    # df = balance_func(df.copy(), col_name=label_col)
+    df['cqcc'] = df[feature_col].apply(transpose_func)
+
+    return df
+
+def load_bilstm_model(input_dim, model_dir="GMM-BiLSTM"):
+    model = BiLSTMClassifier(input_dim=input_dim)
+    model_path = os.path.join(model_dir, "bilstm_model.pt")
+    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+    print(f"Model BiLSTM wczytany z '{model_path}'")
+    return model
