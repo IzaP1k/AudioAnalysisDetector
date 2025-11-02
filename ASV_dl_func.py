@@ -1,4 +1,5 @@
-
+import copy
+import json
 import os
 import pickle
 import random
@@ -96,7 +97,6 @@ def add_dataAugmentation(df, col_name="augmentationType", aug_type=None):
     if aug_type is None:
         aug_type = ['change pitch', 'noise']
 
-    # Dodaj kolumnę jeśli nie istnieje i ustaw wszystkie wartości na None
     if col_name not in df.columns:
         df[col_name] = None
     else:
@@ -105,14 +105,12 @@ def add_dataAugmentation(df, col_name="augmentationType", aug_type=None):
     extra_rows = []
 
     for _, row in df.iterrows():
-        # 80% szansy na dodanie jednego typu augmentacji
         if random.random() < 0.8:
             chosen_aug = random.choice(aug_type)
             row_copy = row.copy()
             row_copy[col_name] = chosen_aug
             extra_rows.append(row_copy)
 
-        # 50% szansy na dodanie dwóch różnych typów augmentacji
         if random.random() < 0.5 and len(aug_type) > 1:
             aug_pair = random.sample(aug_type, 2)
             for aug in aug_pair:
@@ -619,11 +617,11 @@ class ExtractFeatureResidual(nn.Module):
 
 class MoreFeaturesClassifier(nn.Module):
     def __init__(self, num_classes=2):
-        super(MoreFeaturesClassifier, self).__init__()
+        super().__init__()
         self.initial_feature_extract = ExtractFeatureResidual()
 
         self.classifier = nn.Sequential(
-            nn.Linear(96, 128),
+            nn.Linear(192, 128),
             nn.Dropout(p=0.5),
             nn.LeakyReLU(negative_slope=0.01),
             nn.Linear(128, 256),
@@ -637,15 +635,79 @@ class MoreFeaturesClassifier(nn.Module):
         out2 = self.initial_feature_extract(x2)
         out3 = self.initial_feature_extract(x3)
 
-        combined = torch.cat((out1, out2, out3), dim=1)  # dim=1, bo łączymy po cechach (nie po batchu)
+        combined = torch.cat((out1, out2, out3), dim=1)  # dim=1, bo po cesze, nie batchy
 
         out = self.classifier(combined)
         return out
 
+class MultiFeatureDataset(Dataset):
+    def __init__(self, df, feature_cols, label_col='label'):
+
+        assert len(feature_cols) == 3, "Model wymaga trzech wejść!"
+        self.features_1 = df[feature_cols[0]].values
+        self.features_2 = df[feature_cols[1]].values
+        self.features_3 = df[feature_cols[2]].values
+        self.labels = df[label_col].values
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        x1 = np.array(self.features_1[idx])
+        x2 = np.array(self.features_2[idx])
+        x3 = np.array(self.features_3[idx])
+        y = self.labels[idx]
+
+        def format_input(x):
+            if x.ndim == 1:
+                x = x[np.newaxis, :, np.newaxis]
+            elif x.ndim == 2:
+                x = x[np.newaxis, :, :]
+            return torch.tensor(x, dtype=torch.float32)
+
+        return format_input(x1), format_input(x2), format_input(x3), torch.tensor(y, dtype=torch.long)
+
+
+class MobilnetDataset(Dataset):
+    def __init__(self, df, feature_col, label_col='label'):
+        self.features = df[feature_col].values
+        self.labels = df[label_col].values
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        x = np.array(self.features[idx])
+
+        if x.ndim == 2:
+            x = x[np.newaxis, :, :]
+        elif x.ndim == 3 and x.shape[0] != 1:
+            x = x[0:1, :, :]
+
+        y = self.labels[idx]
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
+
+
+class FeatureColumnDataset(Dataset):
+    def __init__(self, df, feature_col, label_col='label'):
+        self.features = df[feature_col].values
+        self.labels = df[label_col].values
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        x = np.array(self.features[idx])
+        y = self.labels[idx]
+        if x.ndim == 1:
+            x = x[np.newaxis, :, np.newaxis]
+        elif x.ndim == 2:
+            x = x[np.newaxis, :, :]
+        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
 class AntiSpoofingResNet(nn.Module):
     def __init__(self, num_classes=2):
-        super(AntiSpoofingResNet, self).__init__()
+        super().__init__()
 
         self.initial_sequence = nn.Sequential(
             nn.Conv2d(in_channels=1, out_channels=32, kernel_size=3, stride=1, padding=1, bias=False),
@@ -681,34 +743,20 @@ class AntiSpoofingResNet(nn.Module):
         return out
 
 
-class FeatureColumnDataset(Dataset):
-    def __init__(self, df, feature_col, label_col='label'):
-        self.features = df[feature_col].values
-        self.labels = df[label_col].values
-
-    def __len__(self):
-        return len(self.features)
-
-    def __getitem__(self, idx):
-        x = np.array(self.features[idx])
-        y = self.labels[idx]
-        if x.ndim == 1:
-            x = x[np.newaxis, :, np.newaxis]
-        elif x.ndim == 2:
-            x = x[np.newaxis, :, :]
-        return torch.tensor(x, dtype=torch.float32), torch.tensor(y, dtype=torch.long)
 
 import torch
 import matplotlib.pyplot as plt
 
+
 def train_loop(model, optimizer, criterion, train_loader, test_loader, device,
                train_losses, val_losses, feature_col, epochs=100):
+    logs = []
+    best_val_loss = float('inf')
+    best_model_state = None
 
     for epoch in range(epochs):
         model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
+        running_loss, correct, total = 0.0, 0, 0
 
         for X_batch, y_batch in train_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
@@ -719,7 +767,6 @@ def train_loop(model, optimizer, criterion, train_loader, test_loader, device,
             if outputs.ndim == 2 and outputs.shape[1] == 1:
                 loss = criterion(outputs, y_batch.float())
                 predicted = (torch.sigmoid(outputs) >= 0.5).float()
-
             else:
                 loss = criterion(outputs, y_batch.long())
                 _, predicted = torch.max(outputs, 1)
@@ -734,11 +781,8 @@ def train_loop(model, optimizer, criterion, train_loader, test_loader, device,
         train_loss = running_loss / total
         train_acc = correct / total
 
-        # Ewaluacja
         model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
+        val_loss, val_correct, val_total = 0.0, 0, 0
 
         with torch.no_grad():
             for X_batch, y_batch in test_loader:
@@ -762,19 +806,27 @@ def train_loop(model, optimizer, criterion, train_loader, test_loader, device,
         train_losses.append(train_loss)
         val_losses.append(val_loss)
 
-        print(f"[{feature_col}] Epoch {epoch + 1}/{epochs} | "
-              f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
-              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+        log_entry = (f"[{feature_col}] Epoch {epoch + 1}/{epochs} | "
+                     f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | "
+                     f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+        logs.append(log_entry)
+        print(log_entry)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model_state = copy.deepcopy(model.state_dict())
 
     plt.figure(figsize=(8, 5))
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Val Loss')
-    plt.title(f'Loss Curve for {feature_col}')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
+    plt.plot(train_losses, label='Treningowe wartości straty')
+    plt.plot(val_losses, label='Walidacyjne wartości straty')
+    plt.title(f'Krzywa wartości straty w trakcie epok nauki dla cechy {feature_col}')
+    plt.xlabel('Epoka')
+    plt.ylabel('Wartość straty')
     plt.legend()
     plt.grid(True)
     plt.show()
+
+    return copy.deepcopy(model.state_dict()), best_model_state, logs
 
 
 def model_result_metrics(model, test_loader, device, y_true, y_pred, y_scores):
@@ -784,9 +836,7 @@ def model_result_metrics(model, test_loader, device, y_true, y_pred, y_scores):
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             outputs = model(X_batch)
 
-            # --- automatyczne rozpoznanie typu modelu ---
             if outputs.ndim == 2 and outputs.shape[1] == 1:
-                # Binary classification → sigmoid
                 probs = torch.sigmoid(outputs).squeeze(1)
                 predicted = (probs >= 0.5).float()
                 y_true.extend(y_batch.cpu().numpy())
@@ -794,11 +844,9 @@ def model_result_metrics(model, test_loader, device, y_true, y_pred, y_scores):
                 y_scores.extend(probs.cpu().numpy())
 
             elif outputs.ndim == 2 and outputs.shape[1] > 1:
-                # Multiclass classification → softmax
                 probs = torch.softmax(outputs, dim=1)
                 _, predicted = torch.max(probs, 1)
 
-                # Jeśli binary softmax (np. 2 klasy), weź tylko kolumnę klasy 1
                 if probs.shape[1] == 2:
                     probs = probs[:, 1]
 
@@ -809,11 +857,9 @@ def model_result_metrics(model, test_loader, device, y_true, y_pred, y_scores):
             else:
                 raise ValueError(f"Nieoczekiwany kształt wyjścia modelu: {outputs.shape}")
 
-    # --- metryki ---
     f1 = f1_score(y_true, y_pred, average='binary' if len(np.unique(y_true)) == 2 else 'macro')
     acc = accuracy_score(y_true, y_pred)
 
-    # EER tylko dla klasyfikacji binarnej
     if len(np.unique(y_true)) == 2:
         fpr, tpr, _ = roc_curve(y_true, y_scores, pos_label=1)
         fnr = 1 - tpr
@@ -823,11 +869,14 @@ def model_result_metrics(model, test_loader, device, y_true, y_pred, y_scores):
         print(f"Final Accuracy: {acc:.4f} | F1 Score (macro): {f1:.4f}")
 
 
-def train_feature_model(final_df, feature_col, label_col='label', batch_size=32, epochs=10, device=None, test_df=None):
+def train_feature_model(model, final_df, feature_col, label_col='label', batch_size=32, epochs=10,
+                        device=None, test_df=None, criterion=None, optimizer=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     if test_df is None:
-        X_train_df, X_test_df = train_test_split(final_df, test_size=0.2, stratify=final_df[label_col], random_state=42)
+        X_train_df, X_test_df = train_test_split(final_df, test_size=0.2,
+                                                 stratify=final_df[label_col], random_state=42)
     else:
         X_train_df = final_df
         X_test_df = test_df
@@ -838,61 +887,144 @@ def train_feature_model(final_df, feature_col, label_col='label', batch_size=32,
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    model = AntiSpoofingResNet(num_classes=2).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    if criterion is None:
+        criterion = nn.CrossEntropyLoss()
 
-    train_losses = []
-    val_losses = []
+    if optimizer is None:
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
 
-    train_loop(model, optimizer, criterion, train_loader, test_loader, device, train_losses, val_losses, feature_col,
-               epochs)
+    train_losses, val_losses = [], []
 
-    y_true = []
-    y_pred = []
-    y_scores = []
-    model_result_metrics(model, test_loader, device, y_true, y_pred, y_scores)
-    return model, test_loader
+    oldest_model_state, best_model_state, logs = train_loop(
+        model, optimizer, criterion, train_loader, test_loader,
+        device, train_losses, val_losses, feature_col, epochs
+    )
 
+    oldest_model = copy.deepcopy(model)
+    oldest_model.load_state_dict(oldest_model_state)
 
+    best_model = copy.deepcopy(model)
+    best_model.load_state_dict(best_model_state)
 
-def train_all_features(final_df, feature_cols, test_df=None, label_col='label', batch_size=32, epochs=10, model_dir="Res_Net", standard_scaler=True):
+    y_true_best, y_pred_best, y_scores_best = [], [], []
+    best_metrics = model_result_metrics(best_model, test_loader, device, y_true_best, y_pred_best, y_scores_best)
+
+    y_true_old, y_pred_old, y_scores_old = [], [], []
+    oldest_metrics = model_result_metrics(oldest_model, test_loader, device, y_true_old, y_pred_old, y_scores_old)
+
+    results = {
+        "best_model": best_model,
+        "oldest_model": oldest_model,
+        "test_loader": test_loader,
+        "logs": logs,
+        "best_metrics": best_metrics,
+        "oldest_metrics": oldest_metrics
+    }
+
+    return results
+
+def train_all_features(final_df, feature_cols, test_df=None, label_col='label',
+                       batch_size=32, epochs=10, model_dir="Res_Net", standard_scaler=True):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     trained_models = {}
 
     os.makedirs(model_dir, exist_ok=True)
 
-    for feat in feature_cols:
-        print(f"\n=== TRENING dla cechy: {feat} ===")
+    optimizers_list = {
+        "Adam": torch.optim.Adam,
+        "AdamW": torch.optim.AdamW,
+        "SGD": torch.optim.SGD
+    }
 
-        if final_df.empty:
-            print(f"[UWAGA] Brak danych do treningu dla cechy {feat} po usunięciu NaN!")
-            continue
+    loss_functions = {
+        "CrossEntropyLoss": nn.CrossEntropyLoss,
+        "MSELoss": nn.MSELoss,
+        "L1Loss": nn.L1Loss
+    }
 
-        feat_dir = os.path.join(model_dir, feat)
+    for opt_name, opt_class in optimizers_list.items():
+        for loss_name, loss_class in loss_functions.items():
+            combo_name = f"{opt_name}_{loss_name}"
+            print(f"\n========== Trening z {combo_name} ==========")
 
-        if standard_scaler:
-            scaler = StandardScaler()
-            all_train_features_for_scaler = np.vstack(final_df[feat].values)
-            scaler.fit(all_train_features_for_scaler)
+            combo_dir = os.path.join(model_dir, combo_name)
+            os.makedirs(combo_dir, exist_ok=True)
 
-            final_df[feat] = final_df[feat].apply(lambda x: scaler.transform(x))
-            if test_df is not None and not test_df.empty:
-                test_df[feat] = test_df[feat].apply(lambda x: scaler.transform(x))
+            for feat in feature_cols:
+                print(f"\n=== TRENING dla cechy: {feat} ===")
 
+                if final_df.empty:
+                    print(f"[UWAGA] Brak danych do treningu dla cechy {feat}!")
+                    continue
 
-            os.makedirs(feat_dir, exist_ok=True)
-            scaler_path = os.path.join(feat_dir, f"{feat}_scaler.pkl")
-            joblib.dump(scaler, scaler_path)
+                feat_dir = os.path.join(combo_dir, feat)
+                os.makedirs(feat_dir, exist_ok=True)
 
-        model, test_loader = train_feature_model(final_df, feat, label_col, batch_size, epochs, device, test_df=test_df)
-        trained_models[feat] = [model, test_loader]
+                if standard_scaler:
+                    scaler = StandardScaler()
+                    all_train_features_for_scaler = np.vstack(final_df[feat].values)
+                    scaler.fit(all_train_features_for_scaler)
 
-        model_path = os.path.join(feat_dir, f"{feat}_model.pt")
-        torch.save(model.state_dict(), model_path)
-        print(f"Model dla cechy '{feat}' zapisany w '{model_path}'")
+                    final_df[feat] = final_df[feat].apply(lambda x: scaler.transform(x))
+                    if test_df is not None and not test_df.empty:
+                        test_df[feat] = test_df[feat].apply(lambda x: scaler.transform(x))
 
-        print(f"=== KONIEC treningu dla cechy: {feat} ===\n")
+                    scaler_path = os.path.join(feat_dir, f"{feat}_scaler.pkl")
+                    joblib.dump(scaler, scaler_path)
+
+                model = AntiSpoofingResNet(num_classes=2).to(device)
+                criterion = loss_class()
+
+                if opt_name == "SGD":
+                    optimizer = opt_class(model.parameters(), lr=1e-3, momentum=0.9)
+                else:
+                    optimizer = opt_class(model.parameters(), lr=1e-4, weight_decay=1e-5)
+
+                results = train_feature_model(
+                    model, final_df, feat, label_col, batch_size, epochs,
+                    device, test_df=test_df, optimizer=optimizer, criterion=criterion
+                )
+
+                best_model = results["best_model"]
+                oldest_model = results["oldest_model"]
+                test_loader = results["test_loader"]
+                logs = results["logs"]
+                best_metrics = results["best_metrics"]
+                oldest_metrics = results["oldest_metrics"]
+
+                best_model_path = os.path.join(feat_dir, f"{feat}_best_model.pt")
+                oldest_model_path = os.path.join(feat_dir, f"{feat}_oldest_model.pt")
+                torch.save(best_model.state_dict(), best_model_path)
+                torch.save(oldest_model.state_dict(), oldest_model_path)
+
+                logs_path = os.path.join(feat_dir, f"{feat}_logs.json")
+                with open(logs_path, "w", encoding="utf-8") as f:
+                    json.dump(results["logs"], f, indent=4, ensure_ascii=False)
+
+                metrics_path = os.path.join(feat_dir, f"{feat}_metrics.json")
+                metrics_data = {
+                    "optimizer": opt_name,
+                    "criterion": loss_name,
+                    "feature": feat,
+                    "best_metrics": best_metrics,
+                    "oldest_metrics": oldest_metrics
+                }
+                with open(metrics_path, "w", encoding="utf-8") as f:
+                    json.dump(metrics_data, f, indent=4, ensure_ascii=False)
+
+                trained_models[(feat, combo_name)] = {
+                    "best_model": best_model_path,
+                    "oldest_model": oldest_model_path,
+                    "metrics": metrics_path,
+                    "logs": logs_path,
+                    "scaler": scaler_path
+                }
+
+                print(f"✅ Zapisano modele i wyniki dla '{feat}' → {combo_name}")
+                print(f"📁 Folder: {feat_dir}")
+                print(f"=== KONIEC treningu dla cechy: {feat} ===\n")
+
+            print(f"========== KONIEC treningu dla {combo_name} ==========\n")
 
     return trained_models
 
@@ -1095,57 +1227,81 @@ def collate_fn_padd(batch):
     return padded_features, labels
 
 
-def BiLSTM_model(train_df, test_df, col_name="cqcc", num_epochs=100, model=None, criterion=None, optimizer=None, model_dir="GMM-BiLSTM"):
-    print("Tworzenie DataLoaderów...")
-    os.makedirs(model_dir, exist_ok=True)
-    print("Utworzono folder: ", model_dir)
+def BiLSTM_model(
+        train_df, test_df, col_name="cqcc", num_epochs=100, model=None,
+        criterion_name="CrossEntropyLoss", optimizer_name="Adam", lr=1e-4,
+        model_dir="GMM-BiLSTM"):
+
+    config_name = f"{optimizer_name}_{criterion_name}_lr{lr}".replace('.', '_')
+    config_dir = os.path.join(model_dir, config_name)
+    os.makedirs(config_dir, exist_ok=True)
+
+    log_file = os.path.join(config_dir, "training_log.txt")
+    csv_log_path = os.path.join(config_dir, "training_log.csv")
+
+    with open(log_file, "w") as f:
+        f.write(f"Start treningu BiLSTM | Optimizer: {optimizer_name} | Criterion: {criterion_name} | LR: {lr}\n")
+        f.write("=" * 100 + "\n")
+
+    print(f"Trening: {optimizer_name}, {criterion_name}, LR={lr}")
+    print(f"Folder: {config_dir}")
 
     train_dataset = AudioDataset(train_df)
     test_dataset = AudioDataset(test_df)
-
     train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, drop_last=False, collate_fn=collate_fn_padd)
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, drop_last=False, collate_fn=collate_fn_padd)
-    print(f"Liczba partii treningowych: {len(train_loader)}, Liczba partii testowych: {len(test_loader)}")
 
     if len(train_df[col_name]) == 0:
-        raise ValueError("Brak danych treningowych po przygotowaniu i normalizacji.")
-
+        raise ValueError("Brak danych treningowych.")
     if train_df[col_name].iloc[0].shape[0] == 0:
         for features_array in train_df[col_name].values:
             if features_array.shape[0] > 0:
                 input_dim = features_array.shape[1]
                 break
         else:
-            raise ValueError(f"Wszystkie sekwencje {col_name} w train_df są puste po przygotowaniu.")
+            raise ValueError(f"Wszystkie sekwencje {col_name} są puste.")
     else:
         input_dim = train_df[col_name].iloc[0].shape[1]
 
     if model is None:
         model = BiLSTMClassifier(input_dim=input_dim)
-    if criterion is None:
-        criterion = nn.CrossEntropyLoss()
-    if optimizer is None:
-        optimizer = optim.Adam(model.parameters(), lr=1e-3)
+
+    criterion_map = {
+        "CrossEntropyLoss": nn.CrossEntropyLoss(),
+        "NLLLoss": nn.NLLLoss(),
+        "MSELoss": nn.MSELoss()
+    }
+    criterion = criterion_map.get(criterion_name, nn.CrossEntropyLoss())
+
+    optimizer_map = {
+        "Adam": optim.Adam(model.parameters(), lr=lr),
+        "AdamW": optim.AdamW(model.parameters(), lr=lr),
+        "SGD": optim.SGD(model.parameters(), lr=lr, momentum=0.9),
+        "RMSprop": optim.RMSprop(model.parameters(), lr=lr)
+    }
+    optimizer = optimizer_map.get(optimizer_name, optim.Adam(model.parameters(), lr=lr))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
 
-    print("Początek pętli treningowej BiLSTM...")
-    start_time_bilstm = time.time()
+    best_model_path = os.path.join(config_dir, "bilstm_best_model.pt")
+    worst_model_path = os.path.join(config_dir, "bilstm_worst_model.pt")
 
-    train_losses = []
-    val_losses = []
+    log_data = []
+    best_val_loss = float("inf")
+    worst_val_loss = float("-inf")
+
+    print(f"Rozpoczęto trening BiLSTM ({optimizer_name}, {criterion_name})...")
+    start_time = time.time()
 
     for epoch in range(num_epochs):
         model.train()
-        train_loss = 0
-        for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
-            if X_batch.size(0) == 0:
-                print(f"Ostrzeżenie: Pusta partia treningowa w epoce {epoch + 1}, batch {batch_idx}. Pomijam.")
-                continue
+        train_loss = 0.0
 
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
+        for X_batch, y_batch in train_loader:
+            if X_batch.size(0) == 0:
+                continue
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
 
             optimizer.zero_grad()
             outputs = model(X_batch)
@@ -1157,21 +1313,15 @@ def BiLSTM_model(train_df, test_df, col_name="cqcc", num_epochs=100, model=None,
         avg_train_loss = train_loss / len(train_loader)
 
         model.eval()
-        val_loss = 0
-        correct = 0
-        total = 0
-
+        val_loss, correct, total = 0.0, 0, 0
         with torch.no_grad():
             for X_val, y_val in test_loader:
                 if X_val.size(0) == 0:
                     continue
-
-                X_val = X_val.to(device)
-                y_val = y_val.to(device)
+                X_val, y_val = X_val.to(device), y_val.to(device)
                 outputs = model(X_val)
                 loss = criterion(outputs, y_val)
                 val_loss += loss.item()
-
                 _, predicted = torch.max(outputs, 1)
                 total += y_val.size(0)
                 correct += (predicted == y_val).sum().item()
@@ -1179,33 +1329,99 @@ def BiLSTM_model(train_df, test_df, col_name="cqcc", num_epochs=100, model=None,
         avg_val_loss = val_loss / len(test_loader)
         val_accuracy = correct / total if total > 0 else 0
 
-        train_losses.append(avg_train_loss)
-        val_losses.append(avg_val_loss)
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), best_model_path)
 
-        print(f"Epoch {epoch + 1}/{num_epochs} | "
-              f"Train Loss: {avg_train_loss:.4f} | "
-              f"Val Loss: {avg_val_loss:.4f} | "
-              f"Val Acc: {val_accuracy:.4f}")
+        if avg_val_loss > worst_val_loss:
+            worst_val_loss = avg_val_loss
+            torch.save(model.state_dict(), worst_model_path)
 
-    end_time_bilstm = time.time()
-    print(f"Trening BiLSTM zakończony w {end_time_bilstm - start_time_bilstm:.2f} sekund.")
+        log_entry = {
+            "epoch": epoch + 1,
+            "train_loss": avg_train_loss,
+            "val_loss": avg_val_loss,
+            "val_accuracy": val_accuracy
+        }
+        log_data.append(log_entry)
+
+        log_line = f"Epoch {epoch + 1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.4f}"
+        print(log_line)
+        with open(log_file, "a") as f:
+            f.write(log_line + "\n")
+
+    total_time = time.time() - start_time
+    with open(log_file, "a") as f:
+        f.write("=" * 100 + "\n")
+        f.write(f"Czas treningu: {total_time:.2f} s\n")
+        f.write(f"Najlepszy val_loss: {best_val_loss:.4f}\n")
+        f.write(f"Najgorszy val_loss: {worst_val_loss:.4f}\n")
+
+    df_logs = pd.DataFrame(log_data)
+    df_logs.to_csv(csv_log_path, index=False)
 
     plt.figure(figsize=(8, 5))
-    plt.plot(train_losses, label="Train Loss")
-    plt.plot(val_losses, label="Val Loss")
-    plt.title("BiLSTM Loss over Epochs")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
+    plt.plot(df_logs["epoch"], df_logs["train_loss"], label="Train Loss")
+    plt.plot(df_logs["epoch"], df_logs["val_loss"], label="Val Loss")
+    plt.title(f"Loss ({optimizer_name}, {criterion_name}, LR={lr})")
+    plt.xlabel("Epoki")
+    plt.ylabel("Strata")
     plt.legend()
     plt.grid(True)
-    plt.show()
+    plt.savefig(os.path.join(config_dir, "loss_plot.png"))
+    plt.close()
 
-    model_path = os.path.join(model_dir, "bilstm_model.pt")
-    torch.save(model.state_dict(), model_path)
-    print(f"Model BiLSTM zapisany w '{model_path}'")
+    plt.figure(figsize=(8, 5))
+    plt.plot(df_logs["epoch"], df_logs["val_accuracy"], label="Val Accuracy", color="green")
+    plt.title(f"Accuracy ({optimizer_name}, {criterion_name}, LR={lr})")
+    plt.xlabel("Epoki")
+    plt.ylabel("Dokładność")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(config_dir, "accuracy_plot.png"))
+    plt.close()
 
-    return model, test_loader
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
+    model.eval()
+    y_true, y_pred, y_scores = [], [], []
 
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            if outputs.shape[1] == 1:
+                probs = torch.sigmoid(outputs).squeeze(1)
+                predicted = (probs >= 0.5).float()
+                y_scores.extend(probs.cpu().numpy())
+            else:
+                probs = torch.softmax(outputs, dim=1)
+                _, predicted = torch.max(probs, 1)
+                if probs.shape[1] == 2:
+                    y_scores.extend(probs[:, 1].cpu().numpy())
+                else:
+                    y_scores.extend(torch.max(probs, dim=1)[0].cpu().numpy())
+            y_true.extend(y_batch.cpu().numpy())
+            y_pred.extend(predicted.cpu().numpy())
+
+    y_true, y_pred, y_scores = np.array(y_true), np.array(y_pred), np.array(y_scores)
+    f1 = f1_score(y_true, y_pred, average='binary' if len(np.unique(y_true)) == 2 else 'macro')
+    acc = accuracy_score(y_true, y_pred)
+
+    if len(np.unique(y_true)) == 2:
+        fpr, tpr, _ = roc_curve(y_true, y_scores)
+        fnr = 1 - tpr
+        eer = fpr[np.nanargmin(np.abs(fnr - fpr))]
+        print(f"Final metrics: F1={f1:.4f}, EER={eer:.4f}, Accuracy={acc:.4f}")
+    else:
+        print(f"Final metrics: F1={f1:.4f}, Accuracy={acc:.4f}")
+
+    return model, test_loader, {
+        "best_val_loss": best_val_loss,
+        "worst_val_loss": worst_val_loss,
+        "config_dir": config_dir,
+        "f1": f1,
+        "accuracy": acc
+    }
 
 
 class BiLSTMClassifier(nn.Module):
